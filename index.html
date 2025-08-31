@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mandelbrot Zoom – Minimal WebGL (React, no-build)</title>
+    <!-- Tailwind CDN (for the UI classes used in the component) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React 18 + ReactDOM UMD -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <!-- Babel standalone so we can write JSX in-browser (dev/demo only) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+      html, body { height: 100%; }
+      body { margin: 0; background: #0a0a0a; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-presets="env,react">
+      const { useEffect, useRef, useState, useCallback } = React;
+
+      function MandelbrotViewer() {
+        // Defaults
+        const DEFAULT_CENTER = { x: -0.5, y: 0.0 };
+        const DEFAULT_SCALE = 1.8;
+        const DEFAULT_ITER = 300;
+        const RUN_SMOKE_TESTS = true;
+
+        const canvasRef = useRef(null);
+        const glRef = useRef(null);
+        const programRef = useRef(null);
+        const uLocRef = useRef({});
+        const frameRef = useRef(0);
+        const lastTsRef = useRef(0);
+        const ranSmokeRef = useRef(false);
+
+        const centerRef = useRef({ ...DEFAULT_CENTER });
+        const scaleRef = useRef(DEFAULT_SCALE);
+        const iterRef = useRef(DEFAULT_ITER);
+        const paletteRef = useRef(0);
+
+        const [isPlaying, setIsPlaying] = useState(false);
+        const [speed, setSpeed] = useState(0.3);
+        const [maxIter, setMaxIter] = useState(DEFAULT_ITER);
+        const [paletteIdx, setPaletteIdx] = useState(0);
+
+        const isDraggingRef = useRef(false);
+        const lastDragRef = useRef({ x: 0, y: 0 });
+
+        const vertexSrc = `
+          attribute vec2 a_pos;
+          void main(){
+            gl_Position = vec4(a_pos, 0.0, 1.0);
+          }
+        `;
+
+        const fragmentSrc = `#ifdef GL_ES
+          precision highp float;
+          precision mediump int;
+          #endif
+
+          uniform vec2 u_resolution;
+          uniform vec2 u_center;
+          uniform float u_scale;
+          uniform float u_aspect;
+          uniform int u_maxIter;
+          uniform int u_palette;
+
+          const float BAIL2 = 256.0;
+          const int   MAX_STEPS = 2000;
+
+          vec3 pal(float t, vec3 a, vec3 b, vec3 c, vec3 d) {
+            return a + b * cos(6.28318 * (c * t + d));
+          }
+          vec3 palette(int idx, float t) {
+            if (idx == 0) {
+              return pal(t, vec3(0.5), vec3(0.5), vec3(1.0, 1.0, 1.0), vec3(0.0, 0.33, 0.67));
+            } else if (idx == 1) {
+              return pal(t, vec3(0.2,0.3,0.5), vec3(0.8,0.7,0.5), vec3(1.0,1.0,1.0), vec3(0.0,0.35,0.7));
+            } else if (idx == 2) {
+              return pal(t, vec3(0.5,0.5,0.5), vec3(0.5,0.5,0.5), vec3(1.0,0.8,0.2), vec3(0.0,0.15,0.75));
+            } else if (idx == 3) {
+              return pal(t, vec3(0.6,0.4,0.3), vec3(0.5,0.6,0.7), vec3(1.0,1.0,1.0), vec3(0.0,0.2,0.4));
+            } else {
+              return vec3(t);
+            }
+          }
+
+          void main(){
+            vec2 uv = (gl_FragCoord.xy / u_resolution) * 2.0 - 1.0;
+            uv.x *= u_aspect;
+            vec2 c = u_center + vec2(uv.x * u_scale, uv.y * u_scale);
+
+            vec2 z = vec2(0.0);
+            float m2 = 0.0;
+            int iter = 0;
+
+            for (int j = 0; j < MAX_STEPS; ++j) {
+              if (j >= u_maxIter) { iter = j; break; }
+              vec2 z2 = vec2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + c;
+              z = z2;
+              m2 = dot(z, z);
+              iter = j;
+              if (m2 > BAIL2) { break; }
+            }
+
+            if (iter >= u_maxIter) {
+              gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+              return;
+            }
+
+            float fi = float(iter);
+            float smooth = fi - log2(log(max(1.0001, sqrt(m2))));
+            float t = clamp(smooth / float(u_maxIter), 0.0, 1.0);
+            vec3 col = palette(u_palette, t);
+            gl_FragColor = vec4(col, 1.0);
+          }
+        `;
+
+        const compileGL = useCallback((canvas) => {
+          const gl = canvas.getContext("webgl", { antialias: false, preserveDrawingBuffer: false });
+          if (!gl) throw new Error("WebGL not supported");
+
+          function createShader(type, src) {
+            const sh = gl.createShader(type);
+            gl.shaderSource(sh, src);
+            gl.compileShader(sh);
+            if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+              const info = gl.getShaderInfoLog(sh);
+              gl.deleteShader(sh);
+              throw new Error("Shader compile error:\n" + info);
+            }
+            return sh;
+          }
+          function createProgram(vsSrc, fsSrc) {
+            const vs = createShader(gl.VERTEX_SHADER, vsSrc);
+            const fs = createShader(gl.FRAGMENT_SHADER, fsSrc);
+            const prog = gl.createProgram();
+            gl.attachShader(prog, vs);
+            gl.attachShader(prog, fs);
+            gl.linkProgram(prog);
+            if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+              const info = gl.getProgramInfoLog(prog);
+              gl.deleteProgram(prog);
+              throw new Error("Program link error:\n" + info);
+            }
+            return prog;
+          }
+
+          const prog = createProgram(vertexSrc, fragmentSrc);
+          gl.useProgram(prog);
+
+          const buf = gl.createBuffer();
+          gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+          const verts = new Float32Array([
+            -1, -1,
+             3, -1,
+            -1,  3,
+          ]);
+          gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+
+          const aPos = gl.getAttribLocation(prog, "a_pos");
+          gl.enableVertexAttribArray(aPos);
+          gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+          const uloc = {
+            u_resolution: gl.getUniformLocation(prog, "u_resolution"),
+            u_center: gl.getUniformLocation(prog, "u_center"),
+            u_scale: gl.getUniformLocation(prog, "u_scale"),
+            u_aspect: gl.getUniformLocation(prog, "u_aspect"),
+            u_maxIter: gl.getUniformLocation(prog, "u_maxIter"),
+            u_palette: gl.getUniformLocation(prog, "u_palette"),
+          };
+
+          glRef.current = gl;
+          programRef.current = prog;
+          uLocRef.current = uloc;
+        }, []);
+
+        const resize = useCallback(() => {
+          const canvas = canvasRef.current;
+          if (!canvas || !glRef.current) return;
+          const gl = glRef.current;
+          const dpr = window.devicePixelRatio || 1;
+          const displayW = Math.floor(canvas.clientWidth * dpr);
+          const displayH = Math.floor(canvas.clientHeight * dpr);
+          if (canvas.width !== displayW || canvas.height !== displayH) {
+            canvas.width = displayW;
+            canvas.height = displayH;
+          }
+          gl.viewport(0, 0, canvas.width, canvas.height);
+        }, []);
+
+        const worldPerPixel = useCallback(() => {
+          const canvas = canvasRef.current;
+          const s = scaleRef.current;
+          const aspect = canvas.width / canvas.height;
+          return {
+            dx: (2 * aspect * s) / canvas.width,
+            dy: (2 * s) / canvas.height,
+            aspect,
+          };
+        }, []);
+
+        const draw = useCallback(() => {
+          const gl = glRef.current; if (!gl) return;
+          const canvas = canvasRef.current; const uloc = uLocRef.current;
+          gl.useProgram(programRef.current);
+          const aspect = canvas.width / canvas.height;
+          gl.uniform2f(uloc.u_resolution, canvas.width, canvas.height);
+          gl.uniform2f(uloc.u_center, centerRef.current.x, centerRef.current.y);
+          gl.uniform1f(uloc.u_scale, scaleRef.current);
+          gl.uniform1f(uloc.u_aspect, aspect);
+          gl.uniform1i(uloc.u_maxIter, iterRef.current);
+          gl.uniform1i(uloc.u_palette, paletteRef.current);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+          if (RUN_SMOKE_TESTS && !ranSmokeRef.current) {
+            ranSmokeRef.current = true;
+            try {
+              console.groupCollapsed("Mandelbrot Smoke Tests");
+              console.assert(programRef.current, "Program exists");
+              console.assert(uLocRef.current.u_center !== null, "u_center location OK");
+              console.assert(uLocRef.current.u_maxIter !== null, "u_maxIter location OK");
+              const px = new Uint8Array(4);
+              const halfX = (canvas.width / 2) | 0;
+              const halfY = (canvas.height / 2) | 0;
+              gl.readPixels(halfX, halfY, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+              console.assert(px.length === 4, "readPixels returned a 4-byte RGBA");
+              console.groupEnd();
+            } catch (err) {
+              console.warn("Smoke tests had an issue:", err);
+            }
+          }
+        }, []);
+
+        const animate = useCallback((ts) => {
+          const gl = glRef.current; if (!gl) return;
+          const dt = lastTsRef.current ? (ts - lastTsRef.current) / 1000 : 0;
+          lastTsRef.current = ts;
+          if (isPlaying) {
+            const factor = Math.exp(-speed * dt);
+            scaleRef.current *= factor;
+          }
+          draw();
+          frameRef.current = requestAnimationFrame(animate);
+        }, [draw, isPlaying, speed]);
+
+        useEffect(() => {
+          const canvas = canvasRef.current;
+          try { compileGL(canvas); } catch (e) {
+            console.error(e);
+            const ctx = canvas.getContext("2d");
+            if (ctx) {
+              ctx.fillStyle = "#000";
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              ctx.fillStyle = "#fff";
+              ctx.font = "14px ui-monospace, SFMono-Regular, Menlo, monospace";
+              ctx.fillText("WebGL init failed. See console.", 12, 24);
+            }
+            return;
+          }
+          const onResize = () => { resize(); draw(); };
+          window.addEventListener("resize", onResize);
+          resize();
+          draw();
+          frameRef.current = requestAnimationFrame(animate);
+          return () => {
+            cancelAnimationFrame(frameRef.current);
+            window.removeEventListener("resize", onResize);
+          };
+        }, [compileGL, resize, draw, animate]);
+
+        useEffect(() => { iterRef.current = maxIter; draw(); }, [maxIter, draw]);
+        useEffect(() => { paletteRef.current = paletteIdx; draw(); }, [paletteIdx, draw]);
+
+        const onPointerDown = (e) => {
+          isDraggingRef.current = true;
+          lastDragRef.current = { x: e.clientX, y: e.clientY };
+          e.target?.setPointerCapture?.(e.pointerId);
+        };
+        const onPointerUp = (e) => {
+          isDraggingRef.current = false;
+          e.target?.releasePointerCapture?.(e.pointerId);
+        };
+        const onPointerMove = (e) => {
+          if (!isDraggingRef.current) return;
+          const dx = e.clientX - lastDragRef.current.x;
+          const dy = e.clientY - lastDragRef.current.y;
+          lastDragRef.current = { x: e.clientX, y: e.clientY };
+          const { dx: wx, dy: wy } = worldPerPixel();
+          centerRef.current.x -= dx * wx;
+          centerRef.current.y += dy * wy;
+          draw();
+        };
+
+        const onWheel = (e) => {
+          e.preventDefault();
+          const canvas = canvasRef.current;
+          const rect = canvas.getBoundingClientRect();
+          const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+          const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+          const { aspect } = worldPerPixel();
+          const uvx = (x / canvas.width) * 2 - 1;
+          const uvy = (y / canvas.height) * 2 - 1;
+          const cx = centerRef.current.x + (uvx * aspect) * scaleRef.current;
+          const cy = centerRef.current.y + (uvy) * scaleRef.current;
+          const factor = Math.exp(e.deltaY * 0.0015);
+          centerRef.current.x = cx - (cx - centerRef.current.x) * factor;
+          centerRef.current.y = cy - (cy - centerRef.current.y) * factor;
+          scaleRef.current *= factor;
+          draw();
+        };
+
+        const onReset = () => {
+          centerRef.current = { ...DEFAULT_CENTER };
+          scaleRef.current = DEFAULT_SCALE;
+          setMaxIter(DEFAULT_ITER);
+          setPaletteIdx(0);
+          setSpeed(0.3);
+          setIsPlaying(false);
+          draw();
+        };
+
+        const autoIterHint = () => {
+          const s = scaleRef.current;
+          const target = Math.min(5000, Math.floor(DEFAULT_ITER * (1 + Math.log(1 + (DEFAULT_SCALE / Math.max(1e-9, s))))));
+          return target;
+        };
+
+        return (
+          <div className="w-full h-full min-h-[80vh] grid grid-rows-[1fr_auto] gap-2 p-3 bg-neutral-900 text-neutral-100">
+            <div className="relative rounded-2xl overflow-hidden border border-neutral-800 shadow-lg">
+              <canvas
+                ref={canvasRef}
+                className="w-full h-[60vh] block bg-black"
+                onPointerDown={onPointerDown}
+                onPointerUp={onPointerUp}
+                onPointerLeave={onPointerUp}
+                onPointerMove={onPointerMove}
+                onWheel={onWheel}
+              />
+              <div className="absolute left-3 top-3 px-2 py-1 rounded-md text-xs bg-black/50 backdrop-blur border border-white/10">
+                <div>Center: {centerRef.current.x.toFixed(6)}, {centerRef.current.y.toFixed(6)}</div>
+                <div>Scale: {scaleRef.current.toExponential(3)}</div>
+                <div>Auto-iter hint: {autoIterHint()}</div>
+              </div>
+            </div>
+
+            <div className="grid md:grid-cols-5 sm:grid-cols-2 grid-cols-1 gap-3 items-center">
+              <div className="flex items-center gap-2">
+                <button
+                  className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-95 transition"
+                  onClick={() => setIsPlaying((v) => !v)}
+                  aria-label="Play/Pause"
+                >
+                  {isPlaying ? "⏸️ Pause" : "▶️ Play"}
+                </button>
+                <button
+                  className="px-3 py-2 rounded-xl bg-neutral-700 hover:bg-neutral-600 active:scale-95 transition"
+                  onClick={onReset}
+                >
+                  Reset
+                </button>
+              </div>
+
+              <label className="flex flex-col text-sm gap-1">
+                <span>Speed ({speed.toFixed(2)}×)</span>
+                <input type="range" min={-2} max={2} step={0.01}
+                  value={speed}
+                  onChange={(e) => setSpeed(parseFloat(e.target.value))}
+                  className="w-full" />
+                <span className="text-xs text-neutral-400">Negative reverses zoom</span>
+              </label>
+
+              <label className="flex flex-col text-sm gap-1">
+                <span>Max Iterations ({maxIter})</span>
+                <input type="range" min={50} max={5000} step={10}
+                  value={maxIter}
+                  onChange={(e) => setMaxIter(parseInt(e.target.value))}
+                  className="w-full" />
+              </label>
+
+              <label className="flex flex-col text-sm gap-1">
+                <span>Palette</span>
+                <select value={paletteIdx}
+                  onChange={(e) => setPaletteIdx(parseInt(e.target.value))}
+                  className="px-2 py-2 rounded-xl bg-neutral-800 border border-neutral-700">
+                  <option value={0}>Classic</option>
+                  <option value={1}>IceFire</option>
+                  <option value={2}>Neon</option>
+                  <option value={3}>Sunset</option>
+                  <option value={4}>Grayscale</option>
+                </select>
+              </label>
+
+              <div className="text-xs text-neutral-400">
+                <div className="font-semibold text-neutral-200">Tips</div>
+                <div>Drag to pan. Wheel to zoom toward cursor. Play for continuous zoom.</div>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      const root = ReactDOM.createRoot(document.getElementById('root'));
+      root.render(<MandelbrotViewer />);
+    </script>
+  </body>
+</html>
